@@ -52,10 +52,11 @@ SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
 `POST /api/v1/audits/csv`、`POST /api/v1/audits/gate`、
 `POST /api/v1/identifiers/normalization`、
-`POST /api/v1/identifiers/normalization/fix-preview` 与
-`POST /api/v1/identifiers/mixed-script`
+`POST /api/v1/identifiers/normalization/fix-preview`、
+`POST /api/v1/identifiers/mixed-script` 与
+`POST /api/v1/urls/query-keys`
 随服务一起可用（均通过宿主机 8000 端口访问，例如
-<http://localhost:8000/api/v1/identifiers/mixed-script>）。
+<http://localhost:8000/api/v1/urls/query-keys>）。
 
 ### 仅用 Docker
 
@@ -734,6 +735,106 @@ curl -s -X POST http://localhost:8000/api/v1/identifiers/mixed-script \
 `unterminated_statement` / `indentation_error`，含原文码点偏移 `offset` 与
 `line` / `column`）；缺少 `source` 字段返回 422（Pydantic 校验）。
 
+### `POST /api/v1/urls/query-keys` — URL 查询键歧义审计
+
+接收一个**原始 URL**（`url` 字段），定位其查询串（第一个 `?` 之后、第一个 `#`
+之前；`#` 出现在 `?` 之前时 `?` 属于片段内容，视为无查询串），按**未解码**的
+`&` 切分参数、按每段**第一个** `=` 切出键（值本身可含 `=`；`&&`、首尾 `&` 产生
+的零长度段无键，直接跳过；`=1` 这类空键段保留），并保留每个键在原 URL 中的
+码点起止偏移（0 起始、end 排他）。
+
+随后对每个**键**（参数值不参与）依次执行：
+
+1. **一次**百分号 UTF-8 解码：`%XX` 十六进制三联体解码为字节、`+` 视为空格，
+   拼成的字节序列按 UTF-8 解码。只解码一次——`%2520` 得到字面文本 `%20` 而非
+   空格，`%2B` 是加号而非空格；原样出现的非 ASCII 字符按 UTF-8 透传；
+2. **NFKC 归一化**。
+
+当**两个及以上**参数的键归一化后相同（包括完全重复的键——即 HTTP 参数污染
+形态），报告一个碰撞组。每个碰撞组给出归一化形式 `normalised` 与全部出现
+`occurrences[]`：参数序号 `index`（0 起始，按保留下来的参数编号）、原始键
+`raw`、解码后（归一化前）的键 `decoded`、键在原 URL 中的起止偏移
+`start` / `end`。碰撞组按各自首次出现的参数序号排序，输出稳定。
+
+**参数值从不解码、不参与比较**：值里的 `%zz`、`%FF` 等不会触发错误，相同的值
+也不会构成碰撞。接口**只读**：`stored: false`，不写入任何记录。
+
+`docker compose up --build` 启动后在宿主机 8000 端口直接调用：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/urls/query-keys \
+  -H 'Content-Type: application/json' \
+  -d '{"url": "https://example.com/p?a=1&%61=2&a+b=3&a%20b=4&%EF%BC%B8=5&X=6#frag"}' | jq
+```
+
+响应：
+
+```json
+{
+  "stored": false,
+  "url_length": 66,
+  "query": {"start": 22, "end": 61},
+  "parameter_count": 6,
+  "distinct_key_count": 3,
+  "collision_count": 3,
+  "collisions": [
+    {
+      "normalised": "a",
+      "occurrence_count": 2,
+      "occurrences": [
+        {"index": 0, "raw": "a", "decoded": "a", "start": 22, "end": 23},
+        {"index": 1, "raw": "%61", "decoded": "a", "start": 26, "end": 29}
+      ]
+    },
+    {
+      "normalised": "a b",
+      "occurrence_count": 2,
+      "occurrences": [
+        {"index": 2, "raw": "a+b", "decoded": "a b", "start": 32, "end": 35},
+        {"index": 3, "raw": "a%20b", "decoded": "a b", "start": 38, "end": 43}
+      ]
+    },
+    {
+      "normalised": "X",
+      "occurrence_count": 2,
+      "occurrences": [
+        {"index": 4, "raw": "%EF%BC%B8", "decoded": "Ｘ", "start": 46, "end": 55},
+        {"index": 5, "raw": "X", "decoded": "X", "start": 58, "end": 59}
+      ]
+    }
+  ]
+}
+```
+
+> 上例中 `%61` 解码为 `a`、`a+b` 与 `a%20b` 都解码为 `a b`、`%EF%BC%B8` 解码为
+> 全角 `Ｘ`（U+FF38）并经 NFKC 归一化为 `X`，分别与字面键碰撞；`#frag` 是片段，
+> 不参与切分。`start` / `end` 是原 URL 的码点偏移，可直接切片复核
+> （`url[26:29] == "%61"`）。无查询串时 `query` 为 `null`、各计数为 0。
+
+错误情况（均返回 **422**，响应只含 `detail`、**不输出部分报告**——所有键先完成
+解码校验才汇总碰撞；接口只读，任何情况下都不写入记录）：
+
+| `detail.error` | 条件 |
+|---|---|
+| `invalid_percent_encoding` | 键中 `%` 后未跟两个十六进制数字（`offset` 定位到该 `%`） |
+| `invalid_utf8` | 键百分号解码后的字节序列不是合法 UTF-8（`offset` 定位到产生非法序列的 `%`） |
+
+`detail` 同时含原 URL 码点偏移 `offset`、1 起始行列 `line` / `column`、出错参数
+的序号 `parameter_index` 与 `message`；缺少 `url` 字段返回 422（Pydantic 校验）。
+
+```json
+{
+  "detail": {
+    "error": "invalid_utf8",
+    "offset": 5,
+    "line": 1,
+    "column": 6,
+    "parameter_index": 1,
+    "message": "the percent-decoded key of parameter 1 is not valid UTF-8 (invalid continuation byte)"
+  }
+}
+```
+
 ### `GET /api/v1/audits` — 查询历史记录
 
 支持按风险级别精确过滤、按文件名（大小写不敏感子串）过滤与分页：
@@ -1140,6 +1241,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
 │   ├── csv_audit.py   # CSV 解析（引号/转义/CRLF）+ 公式伪装单元格审计（只读）
+│   ├── url_audit.py   # URL 查询串切分（未解码 & / =）+ 键的百分号/UTF-8 解码与 NFKC 碰撞审计（只读）
 │   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告、码点偏移、碰撞修复预览与拉丁/希腊/西里尔混写检测
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
@@ -1155,6 +1257,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
 │   ├── test_csv_audit.py # CSV 公式伪装审计（解析/前缀/位置/422/只读）
+│   ├── test_url_query_keys.py # URL 查询键歧义审计（查询串定位/切分/单次解码/NFKC 碰撞/偏移/422/只读）
 │   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
 │   ├── test_identifier_fix_preview.py # 碰撞修复预览（仅改非规范拼写/编辑偏移/重扫/BOM/CRLF/422/不落库）
 │   ├── test_mixed_script.py # 标识符混写检测（脚本分类/逐字符偏移/逐次报告/BOM/CRLF/422/不落库）
@@ -1227,7 +1330,15 @@ CSV 公式伪装审计覆盖逗号分隔/双引号包围/`""` 转义/CRLF 与 LF
 `\r` 视为字段内容）解析、引号内换行与空单元格不造成记录/位置错位、空格/制表符/
 双向控制符前缀跳过后的 `=`/`+`/`-`/`@` 命中、记录号/字段号与原文行列映射、
 逐字符前缀明细（space/tab/bidi 缩写）、复用 bidi 解析器的单元格风险级别、
-未闭合/非法引号的 422 原文行列，以及接口只读不落库。
+未闭合/非法引号的 422 原文行列，以及接口只读不落库；URL 查询键歧义审计覆盖
+查询串定位（首个 `?`、`#` 片段终止、片段内的 `?` 不算）、按未解码 `&` / 首个
+`=` 切分（值可含 `=`、零长度段跳过不占序号、空键保留）、单次百分号/UTF-8 解码
+（`+` 为空格、`%2B` 为加号、`%2520` 不再二次解码、原样非 ASCII 透传）、编码后的
+`%26` / `%3D` 不当分隔符、精确重复键与百分号/全角/数学字母/预组合对分解形式等
+NFKC 碰撞、仅大小写不同不碰撞、碰撞组按首次出现排序、码点起止偏移切片复核、
+参数值从不解码也不参与比较（值中非法编码不报错）、无效百分号编码与无效 UTF-8
+的 422 原 URL 偏移/行列/参数序号（含多行 URL、首个非法键优先、出错时不输出
+部分报告），以及接口只读不落库。
 
 ## 设计说明
 

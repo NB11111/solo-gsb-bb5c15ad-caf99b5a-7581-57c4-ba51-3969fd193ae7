@@ -117,6 +117,21 @@ class MixedScriptRequest(BaseModel):
     )
 
 
+class UrlQueryKeysRequest(BaseModel):
+    url: str = Field(
+        ...,
+        description=(
+            "Raw URL. The query component (from the first '?' to the "
+            "first '#' or the end) is split on the undecoded '&' and "
+            "'=' characters; every parameter key is decoded once "
+            "(percent triplets as UTF-8, '+' as a space) and NFKC "
+            "normalised, and keys collapsing to the same normalised "
+            "form are reported as collision groups. Values are never "
+            "decoded or compared."
+        ),
+    )
+
+
 class IdentifierCollisionFixRequest(BaseModel):
     source: str = Field(
         ...,

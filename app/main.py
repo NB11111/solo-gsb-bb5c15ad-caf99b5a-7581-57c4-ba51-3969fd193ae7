@@ -45,7 +45,9 @@ from .schemas import (
     IdentifierNormalizationRequest,
     JsonAuditRequest,
     MixedScriptRequest,
+    UrlQueryKeysRequest,
 )
+from .url_audit import QueryKeyDecodeError, audit_url_query_keys
 from .verify import verify_audit_record
 
 app = FastAPI(
@@ -332,6 +334,53 @@ def audit_csv_formula_cells(payload: CsvAuditRequest) -> dict:
     }
 
 
+@app.post("/api/v1/urls/query-keys")
+def audit_url_query_key_collisions(payload: UrlQueryKeysRequest) -> dict:
+    """Report query keys that collide after decoding and NFKC.
+
+    The raw URL's query component (from the first ``?`` to the first
+    ``#`` or the end) is split on the undecoded ``&`` and ``=``
+    characters, keeping every key's start/end codepoint offsets in the
+    original URL.  Each key is decoded once (percent triplets as UTF-8,
+    ``+`` as a space) and NFKC normalised; two or more keys collapsing
+    to the same normalised form are returned as a collision group with
+    their raw keys, decoded keys, parameter indices and offsets.
+    Parameter values are never decoded or compared.  Read-only: nothing
+    is persisted.  An invalid percent triplet or invalid UTF-8 in a key
+    yields 422 with the original-URL offset and no partial report.
+    """
+    try:
+        report = audit_url_query_keys(payload.url)
+    except QueryKeyDecodeError as exc:
+        line, column = line_col(payload.url, exc.offset)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": exc.error,
+                "offset": exc.offset,
+                "line": line,
+                "column": column,
+                "parameter_index": exc.parameter_index,
+                "message": exc.message,
+            },
+        )
+    query = (
+        {"start": report.query_start, "end": report.query_end}
+        if report.query_start is not None
+        else None
+    )
+    collisions = [collision.to_dict() for collision in report.collisions]
+    return {
+        "stored": False,
+        "url_length": len(payload.url),
+        "query": query,
+        "parameter_count": report.parameter_count,
+        "distinct_key_count": report.distinct_key_count,
+        "collision_count": len(collisions),
+        "collisions": collisions,
+    }
+
+
 @app.post("/api/v1/identifiers/normalization", status_code=201)
 def create_identifier_normalization(payload: IdentifierNormalizationRequest) -> dict:
     """Extract Python identifiers and report NFKC normalisation collisions.
@@ -550,6 +599,7 @@ def root() -> dict:
             "POST /api/v1/identifiers/normalization",
             "POST /api/v1/identifiers/normalization/fix-preview",
             "POST /api/v1/identifiers/mixed-script",
+            "POST /api/v1/urls/query-keys",
             "GET  /api/v1/audits",
             "GET  /api/v1/audits/{id}",
             "GET  /api/v1/audits/{id}/verify",
