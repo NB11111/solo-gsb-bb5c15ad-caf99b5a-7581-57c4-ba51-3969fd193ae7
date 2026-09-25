@@ -45,7 +45,9 @@ from .schemas import (
     IdentifierNormalizationRequest,
     JsonAuditRequest,
     MixedScriptRequest,
+    QueryKeysRequest,
 )
+from .url_query_keys import QueryKeyParseError, audit_query_keys
 from .verify import verify_audit_record
 
 app = FastAPI(
@@ -332,6 +334,42 @@ def audit_csv_formula_cells(payload: CsvAuditRequest) -> dict:
     }
 
 
+@app.post("/api/v1/urls/query-keys")
+def audit_url_query_keys(payload: QueryKeysRequest) -> dict:
+    """Report ambiguous (colliding) query parameter keys in a raw URL.
+
+    The query component (between the first ``?`` and the following
+    ``#``, if any) is split into parameters on the undecoded ``&`` and
+    the first undecoded ``=`` of each parameter, keeping every key's
+    codepoint span in the original URL.  Each key is percent-decoded
+    exactly once (``+`` as space, ``%XX`` as UTF-8) and Unicode NFKC
+    normalised; groups of two or more keys with the same normalised
+    form are returned with each member's raw key, decoded key, 1-based
+    parameter number and original position.  Parameter values take no
+    part in decoding or comparison.  A malformed ``%`` triplet or a
+    non-UTF-8 percent-decoded run yields 422 with the original URL
+    offsets and no partial report.  Read-only: nothing is persisted.
+    """
+    try:
+        report = audit_query_keys(payload.url)
+    except QueryKeyParseError as exc:
+        line, column = line_col(payload.url, exc.start)
+        end_line, end_column = line_col(payload.url, exc.end)
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": exc.error,
+                "start": exc.start,
+                "end": exc.end,
+                "line": line,
+                "column": column,
+                "end_position": {"line": end_line, "column": end_column},
+                "message": exc.message,
+            },
+        )
+    return report.to_dict(payload.url)
+
+
 @app.post("/api/v1/identifiers/normalization", status_code=201)
 def create_identifier_normalization(payload: IdentifierNormalizationRequest) -> dict:
     """Extract Python identifiers and report NFKC normalisation collisions.
@@ -545,6 +583,7 @@ def root() -> dict:
             "POST /api/v1/audits/diff",
             "POST /api/v1/audits/json",
             "POST /api/v1/audits/csv",
+            "POST /api/v1/urls/query-keys",
             "POST /api/v1/audits/compare",
             "POST /api/v1/audits/gate",
             "POST /api/v1/identifiers/normalization",

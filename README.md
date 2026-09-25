@@ -43,19 +43,31 @@
 
 ### Docker Compose（推荐）
 
+一条命令构建镜像并以前台方式启动服务（首次运行会自动完成构建）：
+
 ```bash
 docker compose up --build
 ```
 
-服务在 <http://localhost:8000> 启动，交互式文档：<http://localhost:8000/docs>。
+启动后通过宿主机 **8000 端口**访问：
+
+- 服务根地址（接口目录）：<http://localhost:8000/>
+- 健康检查：<http://localhost:8000/health>
+- 交互式文档（Swagger UI）：<http://localhost:8000/docs>
+- OpenAPI 模式：<http://localhost:8000/openapi.json>
+
 SQLite 数据文件保存在命名卷 `bidi-audit-data`（容器内 `/data/audit.db`）。
 启动方式无需改动，新增的 `POST /api/v1/audits/diff`、`POST /api/v1/audits/json`、
-`POST /api/v1/audits/csv`、`POST /api/v1/audits/gate`、
+`POST /api/v1/audits/csv`、`POST /api/v1/urls/query-keys`、
+`POST /api/v1/audits/gate`、
 `POST /api/v1/identifiers/normalization`、
 `POST /api/v1/identifiers/normalization/fix-preview` 与
 `POST /api/v1/identifiers/mixed-script`
 随服务一起可用（均通过宿主机 8000 端口访问，例如
 <http://localhost:8000/api/v1/identifiers/mixed-script>）。
+
+想在后台运行可加 `-d`（`docker compose up -d --build`），用
+`docker compose logs -f` 查看日志、`docker compose down` 停止服务。
 
 ### 仅用 Docker
 
@@ -466,6 +478,113 @@ curl -s -X POST http://localhost:8000/api/v1/audits/csv \
 | `illegal_quote` | 未加引号的字段内出现 `"`，或闭合引号后紧跟非分隔符字符 |
 
 缺少 `document` 字段返回 422（Pydantic 校验）。
+
+### `POST /api/v1/urls/query-keys` — URL 查询键歧义审计
+
+接收一条**原始 URL**（`url` 字段），按**未解码**的字面字符切分查询串并检测
+NFKC 归一化后等价的参数键（HTTP 参数污染 / homoglyph 类歧义，例如
+`?name=...&%6eame=...&ｎame=...` 三个键在服务端框架与肉眼看来都可能是同一个
+`name`）：
+
+- 查询串取第一个 `?` 之后、其后第一个 `#`（fragment）之前的部分；URL 不含 `?`
+  时参数数为 0，返回空报告。
+- 以**原始未解码**的 `&` 切分参数，以每个参数中**第一个未解码**的 `=` 切分键值
+  （后续 `=` 属于值）；因此 `%26` / `%3D` 不会被当作分隔符，空段（连续或结尾
+  的 `&`、空查询串）产生空键参数，无值参数（`...&x&...`）同样成立。
+- 每个键保留其在**原 URL 中的起止码点偏移** `start` / `end`（0 起始、end 排他）
+  与 1 起始的 `position.line` / `column`（列按 Unicode 码点计）。
+- 对每个键执行**一次**百分号解码：`+` 解码为空格，连续的 `%XX` 十六进制三元组
+  按一个整体解码为 **UTF-8**；解码只做一遍（`%2541` 解码为 `%41`，不会再解成
+  `A`），字面非 ASCII 字符原样保留并结束当前百分号字节段。解码后再做
+  **Unicode NFKC 归一化**。
+- **两个及以上参数键的 NFKC 归一化结果相同**即构成碰撞组（原始键完全相同的重复
+  参数也算；仅大小写不同不算——NFKC 保留大小写）。**参数值不参与比较，也不做
+  解码**：值里的非法百分号或非法 UTF-8 不会导致错误。
+
+每个碰撞组返回归一化键 `normalised`、成员数 `count` 与按参数顺序排列的
+`members[]`，每个成员给出参数序号 `index`（1 起始）、**原始键** `raw_key`、
+**解码键** `decoded_key`（百分号/UTF-8 解码后、NFKC 之前）、归一化键
+`normalised_key` 以及在原 URL 中的 `start` / `end` / `position`。碰撞组按各组
+第一个成员的参数序号排序。接口**只读**：`stored: false`，不写入任何记录。
+
+```bash
+# name 有三种写法：ASCII、%6e 百分号编码、全角 ｎ（U+FF4E，NFKC 后同为 name）
+curl -s -X POST http://localhost:8000/api/v1/urls/query-keys \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"url": "https://shop.example/cart?name=a&%6eame=b&ｎame=c&token=keep#frag"}' | jq
+```
+
+响应：
+
+```json
+{
+  "stored": false,
+  "url": "https://shop.example/cart?name=a&%6eame=b&ｎame=c&token=keep#frag",
+  "url_length": 64,
+  "parameter_count": 4,
+  "collision_count": 1,
+  "collisions": [
+    {
+      "normalised": "name",
+      "count": 3,
+      "members": [
+        {"index": 1, "raw_key": "name", "decoded_key": "name",
+         "normalised_key": "name", "start": 26, "end": 30,
+         "position": {"line": 1, "column": 27}},
+        {"index": 2, "raw_key": "%6eame", "decoded_key": "name",
+         "normalised_key": "name", "start": 33, "end": 39,
+         "position": {"line": 1, "column": 34}},
+        {"index": 3, "raw_key": "ｎame", "decoded_key": "ｎame",
+         "normalised_key": "name", "start": 42, "end": 46,
+         "position": {"line": 1, "column": 43}}
+      ]
+    }
+  ]
+}
+```
+
+> `start` / `end` 是相对**整条原始 URL**（含 scheme 与路径）的码点偏移，可直接
+> 切片复核：`url[start:end]` 即原始键。第三个成员的 `decoded_key` 仍是全角
+> `ｎame`——百分号解码与 NFKC 归一化是两步，分别体现在 `decoded_key` 与
+> `normalised_key` 中。`token=keep` 键无歧义，不出现在任何碰撞组中；`#frag`
+> fragment 不参与切分。
+
+无歧义时返回 `collision_count: 0`、`collisions: []`；值里的编码问题被忽略：
+
+```bash
+# 两个键同为 a，构成碰撞；值里的 %zz 与 %c3%28 非法但不报错（值不参与解码）
+curl -s -X POST http://localhost:8000/api/v1/urls/query-keys \
+  -H 'Content-Type: application/json' \
+  -d '{"url": "http://example.com/?a=%zz&a=%c3%28"}' | jq '.collision_count'
+# 1
+```
+
+错误情况（均返回 **422**，且**不输出任何部分报告**——任意一个键解码失败时整个
+请求失败，即使前面的键已经构成碰撞）：
+
+| `detail.error` | 条件 |
+|---|---|
+| `invalid_percent_encoding` | 键中的 `%` 后不足两个十六进制字符（结尾孤立的 `%`、`%4`、`%zz` 等） |
+| `invalid_utf8` | 连续 `%XX` 解码出的字节段不是合法 UTF-8（如 `%C3%28`：0xC3 后跟 0x28 而非续接字节，或 `%ff` 等非法首字节） |
+
+`detail` 给出错单元在**原 URL**中的码点区间 `start` / `end`（end 排他）、
+1 起始的 `line` / `column` 与 `end_position`：
+
+```json
+{
+  "detail": {
+    "error": "invalid_percent_encoding",
+    "start": 11,
+    "end": 14,
+    "line": 1,
+    "column": 12,
+    "end_position": {"line": 1, "column": 15},
+    "message": "'%' must be followed by two hexadecimal digits"
+  }
+}
+```
+
+缺少 `url` 字段或空串返回 422（Pydantic 校验）。
 
 ### `POST /api/v1/identifiers/normalization` — Python 标识符 NFKC 碰撞检测
 
@@ -1140,6 +1259,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── diff_audit.py  # unified diff 解析（多文件/多 hunk/No-newline）+ 新增内容回映射
 │   ├── json_audit.py  # 严格 JSON 解析（位置跟踪/转义解码/重复键）+ 字符串值回映射
 │   ├── csv_audit.py   # CSV 解析（引号/转义/CRLF）+ 公式伪装单元格审计（只读）
+│   ├── url_query_keys.py # 原始 URL 查询键切分（未解码 &/=、原文偏移）+ 一次百分号/UTF-8 解码与 NFKC 碰撞审计（只读）
 │   ├── identifiers.py # Python 标识符提取（tokenize/PEP 3131）+ NFKC 碰撞报告、码点偏移、碰撞修复预览与拉丁/希腊/西里尔混写检测
 │   ├── compare.py     # 两条已存审计记录的回归比较（按缩写+出现次序配对）
 │   ├── gate.py        # 路径风险门禁（分段模板匹配 * / **、规则优先级、阈值判定）
@@ -1155,6 +1275,7 @@ curl -s -X POST http://localhost:8000/api/v1/audits/gate \
 │   ├── test_diff_audit.py # unified diff 审计（解析/回映射/422/落库）
 │   ├── test_json_audit.py # JSON 文档审计（指针/偏移/转义/代理对/重复键/422）
 │   ├── test_csv_audit.py # CSV 公式伪装审计（解析/前缀/位置/422/只读）
+│   ├── test_url_query_keys.py # URL 查询键歧义审计（字面切分/原文偏移/一次百分号解码/NFKC 碰撞/值不解码/422 无部分报告/只读）
 │   ├── test_identifiers.py # 标识符 NFKC 碰撞（提取/关键字/码点偏移/BOM/422/独立落库）
 │   ├── test_identifier_fix_preview.py # 碰撞修复预览（仅改非规范拼写/编辑偏移/重扫/BOM/CRLF/422/不落库）
 │   ├── test_mixed_script.py # 标识符混写检测（脚本分类/逐字符偏移/逐次报告/BOM/CRLF/422/不落库）
@@ -1227,7 +1348,15 @@ CSV 公式伪装审计覆盖逗号分隔/双引号包围/`""` 转义/CRLF 与 LF
 `\r` 视为字段内容）解析、引号内换行与空单元格不造成记录/位置错位、空格/制表符/
 双向控制符前缀跳过后的 `=`/`+`/`-`/`@` 命中、记录号/字段号与原文行列映射、
 逐字符前缀明细（space/tab/bidi 缩写）、复用 bidi 解析器的单元格风险级别、
-未闭合/非法引号的 422 原文行列，以及接口只读不落库。
+未闭合/非法引号的 422 原文行列，以及接口只读不落库；URL 查询键歧义审计覆盖按未解码
+`&` 与第一个 `=` 字面切分（编码后的 `%26`/`%3D` 不切分、空段与结尾 `&` 产生空键、
+无值参数）、查询串起止（首个 `?` 之后、`#` fragment 之前）、键在整条原始 URL 中的
+码点偏移与行列（astral 字符占 1 个码点）、一次百分号解码（`+` 为空格、大小写十六
+进制、不做二次解码、字面非 ASCII 不重编码）、多字节/续接字节/astral 平面 UTF-8 与
+按最大连续 `%XX` 段整体判错、NFKC 碰撞分组（ASCII/全角/百分号拼写、预组合与分解形式、
+原始重复键命中、仅大小写不同不碰撞、组与成员排序）、参数值不解码不比较、空报告与
+422 分支（非法百分号与非法 UTF-8 的原 URL 偏移/行列、无部分报告、缺字段/空 url、
+接口只读）。
 
 ## 设计说明
 

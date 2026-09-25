@@ -139,6 +139,21 @@ class IdentifierCollisionFixRequest(BaseModel):
     )
 
 
+class QueryKeysRequest(BaseModel):
+    url: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Raw URL whose query component is audited. Parameters are "
+            "split on the undecoded '&' and '=' characters; each key is "
+            "percent-decoded once ('+' as space, '%XX' triplets as "
+            "UTF-8) and NFKC normalised. Malformed percent encoding or "
+            "invalid UTF-8 in a key is rejected with 422. Parameter "
+            "values are never decoded or compared."
+        ),
+    )
+
+
 class GateRuleSpec(BaseModel):
     template: str = Field(
         ...,
